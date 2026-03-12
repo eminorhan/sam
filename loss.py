@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -5,8 +6,11 @@ def calc_iou(pred_mask, gt_mask, eps=1e-6):
     """Calculates Intersection over Union between a predicted boolean mask and a ground truth mask."""
     pred_bool = pred_mask > 0.5
     gt_bool = gt_mask > 0.5
-    intersection = (pred_bool & gt_bool).float().sum(dim=(1, 2))
-    union = (pred_bool | gt_bool).float().sum(dim=(1, 2))
+    
+    # FIX 2: Use .to(pred_mask.dtype) instead of .float()
+    intersection = (pred_bool & gt_bool).to(pred_mask.dtype).sum(dim=(1, 2))
+    union = (pred_bool | gt_bool).to(pred_mask.dtype).sum(dim=(1, 2))
+    
     return intersection / (union + eps)
 
 class SAMMultiMaskLoss(nn.Module):

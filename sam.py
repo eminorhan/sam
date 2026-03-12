@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # change the following vars according to your setup
-TORCH_HUB_PATH = "/lustre/blizzard/stf218/scratch/emin/torch_hub"  # this is where the dinov3 pth checkpoints are stored
-DINOV3_REPO_PATH = "/lustre/blizzard/stf218/scratch/emin/dinov3"  # dinov3 repo path
+TORCH_HUB_PATH = "/lustre/polis/stf218/scratch/emin/torch_hub"  # this is where the dinov3 pth checkpoints are stored
+DINOV3_REPO_PATH = "/lustre/polis/stf218/scratch/emin/dinov3"  # dinov3 repo path
 
 torch.hub.set_dir(TORCH_HUB_PATH)
 
@@ -59,18 +59,32 @@ class PromptEncoder(nn.Module):
     def _pe_encoding(self, coords):
         # Maps coordinates from [0, 1] to the positional encoding space
         coords = 2 * coords - 1
+        
+        # ADD THIS LINE: Cast coords to match FSDP's mixed precision buffer
+        coords = coords.to(self.pe_matrix.dtype) 
+        
         coords = coords @ self.pe_matrix
         coords = 2 * torch.pi * coords
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
-        
+
     def forward(self, points=None, boxes=None, image_size=(1024, 1024)):
         B = points[0].shape[0] if points is not None else (boxes.shape[0] if boxes is not None else 1)
-        sparse_embeddings = torch.empty((B, 0, self.embed_dim), device=self.point_embeddings.weight.device)
+        
+        # FIX 1: Dynamically grab the FSDP-assigned dtype (bfloat16)
+        target_dtype = self.point_embeddings.weight.dtype
+        
+        # FIX 2: Explicitly pass the dtype so it doesn't default to float32
+        sparse_embeddings = torch.empty(
+            (B, 0, self.embed_dim), 
+            device=self.point_embeddings.weight.device,
+            dtype=target_dtype
+        )
         
         # Process Points
         if points is not None:
             coords, labels = points
-            coords = coords.float()
+            # FIX 3: Cast to target_dtype instead of .float()
+            coords = coords.to(target_dtype)
             coords[:, :, 0] /= image_size[1]
             coords[:, :, 1] /= image_size[0]
             
@@ -80,7 +94,8 @@ class PromptEncoder(nn.Module):
             
         # Process Boxes
         if boxes is not None:
-            coords = boxes.reshape(B, -1, 2, 2).float() # (B, N, 2(points), 2(x,y))
+            # FIX 4: Cast to target_dtype instead of .float()
+            coords = boxes.reshape(B, -1, 2, 2).to(target_dtype) 
             coords[:, :, :, 0] /= image_size[1]
             coords[:, :, :, 1] /= image_size[0]
             
