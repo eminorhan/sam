@@ -19,11 +19,12 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 import logging
 
-# --- Import custom modules ---
+# Import custom modules
 from dinov3.layers import SelfAttentionBlock
 from sam import SAMDINOv3
 from loss import SAMMultiMaskLoss 
 
+# Distributed setup and cleanup
 def setup_distributed():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -33,6 +34,7 @@ def setup_distributed():
 def cleanup_distributed():
     dist.destroy_process_group()
 
+# Logger
 logger = logging.getLogger()
 
 def init_logger():
@@ -42,6 +44,17 @@ def init_logger():
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     ch.setFormatter(formatter)
     logger.addHandler(ch)
+
+# Learning rate scheduler
+def lr_lambda(current_step, warmup_steps, total_steps):
+    """
+    Calculates the learning rate multiplier for linear warmup and linear decay.
+    """
+    if current_step < warmup_steps:
+        # Linear warmup
+        return float(current_step) / float(max(1, warmup_steps))
+    # Linear decay
+    return max(0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps)))
 
 # ==========================================
 # 1. WebDataset Preprocessing Function
@@ -164,10 +177,8 @@ def train():
         else:
             decoder_params.append(param)
 
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': 1e-5}, 
-        {'params': decoder_params, 'lr': 1e-4}   
-    ], weight_decay=0.05)
+    # Using different learning rates for backbone vs. decoder parameters
+    optimizer = optim.AdamW([{'params': backbone_params, 'lr': 1e-5}, {'params': decoder_params, 'lr': 1e-4}], weight_decay=0.05)
     
     criterion = SAMMultiMaskLoss().to(local_rank)
     
@@ -175,7 +186,15 @@ def train():
     # Because resampled=True makes the dataset infinite, we define "epochs" by step count
     steps_per_epoch = 10_000_000 // (batch_size * 16) 
     epochs = 3
-    
+
+    # --- LR Scheduler ---
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = 100
+
+    # Bind the fixed arguments using partial
+    bound_lr_lambda = partial(lr_lambda, warmup_steps=warmup_steps, total_steps=total_steps)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, bound_lr_lambda)
+
     # Dataloader is an infinite iterator now
     data_iterator = iter(dataloader)
     
@@ -205,26 +224,30 @@ def train():
             
             loss.backward()
             optimizer.step()
-            
+            scheduler.step()
+
             if step % 100 == 0:
-                # 1. Detach and clone the local loss so we don't break the autograd graph
+                # Detach and clone the local loss so we don't break the autograd graph
                 global_loss = loss.detach().clone()
                 
-                # 2. Average the loss across all 16 GPUs
-                # ReduceOp.AVG mathematically sums the tensor across all ranks and divides by world_size
+                # Average the loss across all ranks
                 dist.all_reduce(global_loss, op=dist.ReduceOp.AVG)
                 
-                # 3. Print the globally averaged loss only on Rank 0
-                logger.info(f"Epoch {epoch} | Step {step}/{steps_per_epoch} | Global Loss: {global_loss.item():.4f} ")
+                # Fetch current learning rates for logging
+                lr_backbone = optimizer.param_groups[0]['lr']
+                lr_decoder = optimizer.param_groups[1]['lr']
 
-    # 1. Force all 16 GPUs to wait for each other before anyone starts saving
+                # Print the globally averaged loss only on Rank 0
+                logger.info(f"epoch {epoch} | step {step}/{steps_per_epoch} | loss: {global_loss.item():.4f} | lr (backbone): {lr_backbone:.2e} | lr (decoder): {lr_decoder:.2e} ")
+
+    # Force all ranks to wait for each other before anyone starts saving
     # This prevents timeouts if one node finishes its final batch a few seconds early
     dist.barrier()
     
     if local_rank == 0:
         logger.info("Training complete! Initiating parallel checkpoint save...")
 
-    # 2. Use the modern PyTorch 2.x Distributed Checkpointing API
+    # Use Distributed Checkpointing API
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
     
