@@ -48,8 +48,7 @@ def init_logger():
 # ==========================================
 def preprocess_sa1b(sample, image_size=(1024, 1024)):
     """
-    Takes a tuple of (PIL_Image, JSON_Dict) from WebDataset, 
-    processes them, and returns PyTorch tensors.
+    Takes a tuple of (PIL_Image, JSON_Dict) from WebDataset, processes them, and returns PyTorch tensors.
     """
     image_pil, data = sample
     
@@ -80,6 +79,9 @@ def preprocess_sa1b(sample, image_size=(1024, 1024)):
 # 2. Main Training Loop
 # ==========================================
 def train():
+
+    init_logger()
+
     local_rank = setup_distributed()
 
     # --- Webdataset setup ---
@@ -112,7 +114,7 @@ def train():
     dataloader = wds.WebLoader(
         dataset, 
         batch_size=None,  # Must be None because WebDataset handles batching internally
-        num_workers=4, 
+        num_workers=8, 
         pin_memory=True
     )
 
@@ -204,7 +206,7 @@ def train():
             loss.backward()
             optimizer.step()
             
-            if step % 1000 == 0:
+            if step % 100 == 0:
                 # 1. Detach and clone the local loss so we don't break the autograd graph
                 global_loss = loss.detach().clone()
                 
