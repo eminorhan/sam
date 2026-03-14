@@ -77,7 +77,13 @@ def preprocess_sa1b(sample, image_size=(1024, 1024)):
     x, y, w, h = ann['bbox']
     box_prompt = torch.tensor([x, y, x + w, y + h], dtype=torch.float32)
     
-    # 4. Process RLE Mask
+    # 4. Process Point Prompt
+    # SA-1B provides 'point_coords' as [[x, y]]. We grab the first point.
+    pt = ann['point_coords'][0]
+    point_coords = torch.tensor([pt[0], pt[1]], dtype=torch.float32)
+    point_labels = torch.tensor([1], dtype=torch.long) # 1 signifies a foreground point
+    
+    # 5. Process RLE Mask
     rle = ann['segmentation']
     if isinstance(rle['counts'], str):
         rle['counts'] = rle['counts'].encode('utf-8')
@@ -86,7 +92,7 @@ def preprocess_sa1b(sample, image_size=(1024, 1024)):
     gt_mask = torch.from_numpy(gt_mask_np).float().unsqueeze(0) 
     gt_mask = TF.resize(gt_mask, image_size, interpolation=TF.InterpolationMode.NEAREST)
     
-    return image, box_prompt, gt_mask
+    return image, box_prompt, point_coords, point_labels, gt_mask
 
 # ==========================================
 # 2. Main Training Loop
@@ -202,26 +208,41 @@ def train():
         model.train()
         
         for step in range(steps_per_epoch):
-            # Pull next batch from the stream
-            images, boxes, gt_masks = next(data_iterator)
+            # 1. Pull next batch from the stream
+            images, boxes, pt_coords, pt_labels, gt_masks = next(data_iterator)
             
-            # Note: WebDataset stacks lists of tensors into a final tensor automatically 
-            # when you use .batched(). You just need to move them to the GPU.
-            # However, because boxes was [x1, y1, x2, y2], WebDataset returns a shape of 
-            # (B, 4). Our model expects (B, 1, 4) for a single box per image.
-            boxes = boxes.unsqueeze(1) 
+            # 2. Reshape to match SAM's expected dimensions for a single prompt per image
+            boxes = boxes.unsqueeze(1).to(local_rank)           # Shape: (B, 1, 4)
+            pt_coords = pt_coords.unsqueeze(1).to(local_rank)   # Shape: (B, 1, 2)
+            pt_labels = pt_labels.unsqueeze(1).to(local_rank)   # Shape: (B, 1)
             
             images = images.to(local_rank)
-            boxes = boxes.to(local_rank)
             gt_masks = gt_masks.to(local_rank)
             
             optimizer.zero_grad()
-            pred_masks, iou_preds = model(images, boxes=boxes)
+            
+            # 3. Apply prompt dropout strategy
+            prompt_choice = np.random.choice(["box_only", "point_only", "both"])
+            
+            if prompt_choice == "box_only":
+                model_points = None
+                model_boxes = boxes
+            elif prompt_choice == "point_only":
+                model_points = (pt_coords, pt_labels)
+                model_boxes = None
+            else: # "both"
+                model_points = (pt_coords, pt_labels)
+                model_boxes = boxes
+            
+            # 4. Forward pass
+            pred_masks, iou_preds = model(images, points=model_points, boxes=model_boxes)
 
+            # Sync GT mask precision with FSDP output
             gt_masks = gt_masks.to(pred_masks.dtype)
 
+            # 5. Calculate loss
             loss = criterion(pred_masks, iou_preds, gt_masks)
-            
+
             loss.backward()
             optimizer.step()
             scheduler.step()
