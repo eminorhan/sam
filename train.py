@@ -1,10 +1,12 @@
 import os
+import logging
 import torch
 import torch.optim as optim
 import numpy as np
 import webdataset as wds
-from functools import partial
 import torchvision.transforms.functional as TF
+
+from functools import partial
 from pycocotools import mask as mask_utils
 
 import torch.distributed as dist
@@ -16,8 +18,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
     CheckpointImpl,
 )
-
-import logging
 
 # Import custom modules
 from dinov3.layers import SelfAttentionBlock
@@ -104,13 +104,12 @@ def train():
     local_rank = setup_distributed()
 
     # --- Webdataset setup ---
-    # Define your tarball pattern using brace expansion. 
-    # Adjust the numbers to match your actual file names.
+    # Define tarball pattern using brace expansion. 
     tar_url = "/lustre/polis/stf218/scratch/emin/sa1b/sorted/sa_{000000..000999}.tar"
-    batch_size = 64 
+    batch_size = 64
+    log_steps = 100
     
-    # resampled=True is the magic wand for multi-node. It causes nodes to randomly sample 
-    # tarballs with replacement, meaning you never hit deadlocks at the end of an epoch.
+    # resampled=True causes nodes to randomly sample tarballs with replacement
     dataset = (
         wds.WebDataset(
             tar_url, 
@@ -132,7 +131,7 @@ def train():
     # WebLoader wraps it with multiprocessing workers
     dataloader = wds.WebLoader(
         dataset, 
-        batch_size=None,  # Must be None because WebDataset handles batching internally
+        batch_size=None,  # must be None because WebDataset handles batching internally
         num_workers=8, 
         pin_memory=True
     )
@@ -140,11 +139,10 @@ def train():
     # --- Model Setup ---
     model = SAMDINOv3(model_name='dinov3_vitl16').to(local_rank)
     
-    bf16_ready = torch.version.cuda and torch.cuda.is_bf16_supported()
     mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16 if bf16_ready else torch.float16,
-        reduce_dtype=torch.bfloat16 if bf16_ready else torch.float16,
-        buffer_dtype=torch.bfloat16 if bf16_ready else torch.float16,
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
     )
     
     # --- 1. Activation Checkpointing ---
@@ -184,7 +182,7 @@ def train():
             decoder_params.append(param)
 
     # Using different learning rates for backbone vs. decoder parameters
-    optimizer = optim.AdamW([{'params': backbone_params, 'lr': 1e-5}, {'params': decoder_params, 'lr': 1e-4}], weight_decay=0.05)
+    optimizer = optim.AdamW([{'params': backbone_params, 'lr': 3e-5}, {'params': decoder_params, 'lr': 3e-4}], weight_decay=0.05)
     
     criterion = SAMMultiMaskLoss().to(local_rank)
     
@@ -214,7 +212,7 @@ def train():
             # 2. Reshape to match SAM's expected dimensions for a single prompt per image
             boxes = boxes.unsqueeze(1).to(local_rank)           # Shape: (B, 1, 4)
             pt_coords = pt_coords.unsqueeze(1).to(local_rank)   # Shape: (B, 1, 2)
-            pt_labels = pt_labels.unsqueeze(1).to(local_rank)   # Shape: (B, 1)
+            pt_labels = pt_labels.to(local_rank)                # Shape: (B, 1)
             
             images = images.to(local_rank)
             gt_masks = gt_masks.to(local_rank)
@@ -247,7 +245,7 @@ def train():
             optimizer.step()
             scheduler.step()
 
-            if step % 100 == 0:
+            if step % log_steps == 0:
                 # Detach and clone the local loss so we don't break the autograd graph
                 global_loss = loss.detach().clone()
                 
