@@ -57,42 +57,68 @@ def lr_lambda(current_step, warmup_steps, total_steps):
     return max(0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps)))
 
 # ==========================================
-# 1. WebDataset Preprocessing Function
+# 1. Corrected WebDataset Preprocessing 
 # ==========================================
-def preprocess_sa1b(sample, image_size=(1024, 1024)):
+def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
     """
-    Takes a tuple of (PIL_Image, JSON_Dict) from WebDataset, processes them, and returns PyTorch tensors.
+    Takes a tuple of (PIL_Image, JSON_Dict) from WebDataset.
+    Properly scales SA-1B absolute coordinates to match the resized image.
     """
     image_pil, data = sample
     
-    # 1. Process Image
+    # 1. Calculate scaling factors before resizing
+    orig_w, orig_h = image_pil.size
+    scale_w = image_size[1] / orig_w  # image_size is (H, W)
+    scale_h = image_size[0] / orig_h
+    
+    # 2. Process Image
     image = image_pil.convert("RGB")
     image = TF.resize(image, image_size)
     image = TF.to_tensor(image) # Shape: (3, H, W)
 
-    # 2. Pick a random annotation for this step
-    ann = np.random.choice(data['annotations'])
+    # 3. Pick multiple annotations (pad with replacement if fewer than num_masks)
+    anns = data['annotations']
+    if len(anns) >= num_masks_per_image:
+        selected_anns = np.random.choice(anns, num_masks_per_image, replace=False)
+    else:
+        selected_anns = np.random.choice(anns, num_masks_per_image, replace=True)
     
-    # 3. Process Box Prompt [x, y, w, h] -> [x1, y1, x2, y2]
-    x, y, w, h = ann['bbox']
-    box_prompt = torch.tensor([x, y, x + w, y + h], dtype=torch.float32)
+    boxes, pt_coords, pt_labels, gt_masks = [], [], [], []
     
-    # 4. Process Point Prompt
-    # SA-1B provides 'point_coords' as [[x, y]]. We grab the first point.
-    pt = ann['point_coords'][0]
-    point_coords = torch.tensor([pt[0], pt[1]], dtype=torch.float32)
-    point_labels = torch.tensor([1], dtype=torch.long) # 1 signifies a foreground point
+    for ann in selected_anns:
+        # Box Prompt: Convert XYWH to XYXY AND apply scaling
+        x, y, w, h = ann['bbox']
+        boxes.append([
+            x * scale_w, 
+            y * scale_h, 
+            (x + w) * scale_w, 
+            (y + h) * scale_h
+        ])
+        
+        # Point Prompt: SA-1B format is [[x, y]]. Apply scaling.
+        pt = ann['point_coords'][0]
+        pt_coords.append([[pt[0] * scale_w, pt[1] * scale_h]]) # Shape (1, 2)
+        pt_labels.append([1])                                  # Shape (1)
+        
+        # RLE Mask
+        rle = ann['segmentation']
+        if isinstance(rle['counts'], str):
+            rle['counts'] = rle['counts'].encode('utf-8')
+        
+        gt_mask_np = mask_utils.decode(rle)
+        gt_mask = torch.from_numpy(gt_mask_np).float().unsqueeze(0) # (1, H, W)
+        
+        # Resize mask to match image
+        gt_mask = TF.resize(gt_mask, image_size, interpolation=TF.InterpolationMode.NEAREST)
+        gt_masks.append(gt_mask)
+
+    # Stack into tensors
+    box_prompts = torch.tensor(boxes, dtype=torch.float32)         # (M, 4)
+    point_coords = torch.tensor(pt_coords, dtype=torch.float32)    # (M, 1, 2)
+    point_labels = torch.tensor(pt_labels, dtype=torch.long)       # (M, 1)
+    gt_masks = torch.stack(gt_masks, dim=0)                        # (M, 1, H, W)
     
-    # 5. Process RLE Mask
-    rle = ann['segmentation']
-    if isinstance(rle['counts'], str):
-        rle['counts'] = rle['counts'].encode('utf-8')
-    
-    gt_mask_np = mask_utils.decode(rle)
-    gt_mask = torch.from_numpy(gt_mask_np).float().unsqueeze(0) 
-    gt_mask = TF.resize(gt_mask, image_size, interpolation=TF.InterpolationMode.NEAREST)
-    
-    return image, box_prompt, point_coords, point_labels, gt_mask
+    return image, box_prompts, point_coords, point_labels, gt_masks
 
 # ==========================================
 # 2. Main Training Loop
@@ -106,8 +132,12 @@ def train():
     # --- Webdataset setup ---
     # Define tarball pattern using brace expansion. 
     tar_url = "/lustre/polis/stf218/scratch/emin/sa1b/sorted/sa_{000000..000999}.tar"
-    batch_size = 64
+    model_name = 'dinov3_vit7b16'
+    batch_size = 16
+    num_masks_per_image = 32
+    image_size = (1024, 1024)
     log_steps = 100
+    grad_norm_clip = 1.0
     
     # resampled=True causes nodes to randomly sample tarballs with replacement
     dataset = (
@@ -125,9 +155,11 @@ def train():
         # "jpg;jpeg" tells it to accept either extension to match with the json
         .to_tuple("jpg;jpeg", "json", handler=wds.warn_and_continue) 
         
-        .map(preprocess_sa1b, handler=wds.warn_and_continue)
+        # pass arguments to preprocessing function via partial
+        .map(partial(preprocess_sa1b, image_size=image_size, num_masks_per_image=num_masks_per_image), handler=wds.warn_and_continue)
         .batched(batch_size, partial=False)
-    )    
+    )
+
     # WebLoader wraps it with multiprocessing workers
     dataloader = wds.WebLoader(
         dataset, 
@@ -137,7 +169,7 @@ def train():
     )
 
     # --- Model Setup ---
-    model = SAMDINOv3(model_name='dinov3_vitl16').to(local_rank)
+    model = SAMDINOv3(model_name=model_name).to(local_rank)
     
     mp_policy = MixedPrecision(
         param_dtype=torch.bfloat16,
@@ -206,20 +238,20 @@ def train():
         model.train()
         
         for step in range(steps_per_epoch):
-            # 1. Pull next batch from the stream
+
+            # Yield inputs
             images, boxes, pt_coords, pt_labels, gt_masks = next(data_iterator)
             
-            # 2. Reshape to match SAM's expected dimensions for a single prompt per image
-            boxes = boxes.unsqueeze(1).to(local_rank)           # Shape: (B, 1, 4)
-            pt_coords = pt_coords.unsqueeze(1).to(local_rank)   # Shape: (B, 1, 2)
-            pt_labels = pt_labels.to(local_rank)                # Shape: (B, 1)
+            # boxes: (B, M, 4) | pt_coords: (B, M, 1, 2) | gt_masks: (B, M, 1, H, W)
+            boxes = boxes.to(local_rank)   
+            pt_coords = pt_coords.to(local_rank)   
+            pt_labels = pt_labels.to(local_rank)
             
             images = images.to(local_rank)
             gt_masks = gt_masks.to(local_rank)
             
             optimizer.zero_grad()
             
-            # 3. Apply prompt dropout strategy
             prompt_choice = np.random.choice(["box_only", "point_only", "both"])
             
             if prompt_choice == "box_only":
@@ -228,20 +260,28 @@ def train():
             elif prompt_choice == "point_only":
                 model_points = (pt_coords, pt_labels)
                 model_boxes = None
-            else: # "both"
+            else:
                 model_points = (pt_coords, pt_labels)
                 model_boxes = boxes
             
-            # 4. Forward pass
+            # Forward pass outputs shapes: (B, M, 3, H, W) and (B, M, 3)
             pred_masks, iou_preds = model(images, points=model_points, boxes=model_boxes)
 
-            # Sync GT mask precision with FSDP output
             gt_masks = gt_masks.to(pred_masks.dtype)
 
-            # 5. Calculate loss
-            loss = criterion(pred_masks, iou_preds, gt_masks)
+            # Flatten the B and M dimensions so the loss function processes them like a standard batch
+            # Shape becomes: (B*M, 3, H, W) vs GT of (B*M, 1, H, W)
+            loss = criterion(
+                pred_masks.flatten(0, 1), 
+                iou_preds.flatten(0, 1), 
+                gt_masks.flatten(0, 1)
+            )
 
             loss.backward()
+
+            # FSDP-safe gradient clipping: this safely handles cross-GPU communication to clip sharded gradients
+            model.clip_grad_norm_(grad_norm_clip)
+
             optimizer.step()
             scheduler.step()
 

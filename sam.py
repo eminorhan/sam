@@ -8,15 +8,35 @@ DINOV3_REPO_PATH = "/lustre/polis/stf218/scratch/emin/dinov3"  # dinov3 repo pat
 
 torch.hub.set_dir(TORCH_HUB_PATH)
 
+# You can add a few more dinov3 checkpoints below
+BACKBONE_CKPT_DICT = {
+    "dinov3_vit7b16_3D": "dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth",
+    "dinov3_vit7b16": "dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth",
+    "dinov3_vith16plus_3D": "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth",
+    "dinov3_vith16plus": "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth",
+    "dinov3_vitl16_3D": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "dinov3_vitl16": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "dinov3_vitb16_3D": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_vitb16": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+}
+
 class DINOv3ImageEncoder(nn.Module):
     """
     Loads a DINOv3 backbone, extracts patch features, and projects 
     them to the required embedding dimension for the SAM decoder.
     """
-    def __init__(self, model_name='dinov3_vitl16', out_dim=256):
+    def __init__(self, model_name, out_dim=256):
         super().__init__()
+
         # Load pre-trained DINOv3 from torch.hub
-        self.backbone = torch.hub.load(DINOV3_REPO_PATH, "dinov3_vitl16", source="local", weights=f"{TORCH_HUB_PATH}/checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth", in_chans=3)
+        self.backbone = torch.hub.load(
+            DINOV3_REPO_PATH, 
+            model_name, 
+            source="local", 
+            weights=f"{TORCH_HUB_PATH}/checkpoints/{BACKBONE_CKPT_DICT[model_name]}",  # TODO: a bit hacky, refactor later
+            pretrained=True, 
+            use_fa3=True
+        )
                     
         in_dim = self.backbone.embed_dim 
         
@@ -192,9 +212,8 @@ class MultiMaskDecoder(nn.Module):
         
         return masks, iou_pred
 
-# The wrapper model is updated to return both outputs
 class SAMDINOv3(nn.Module):
-    def __init__(self, model_name='dinov3_vitb16', num_masks=3):
+    def __init__(self, model_name, num_masks=3):
         super().__init__()
         self.num_masks = num_masks
         self.image_encoder = DINOv3ImageEncoder(model_name) # From previous snippet
@@ -202,14 +221,44 @@ class SAMDINOv3(nn.Module):
         self.mask_decoder = MultiMaskDecoder(transformer_dim=256, num_masks=num_masks)
         
     def forward(self, image, points=None, boxes=None):
+        B = image.shape[0]
         image_size = (image.shape[2], image.shape[3])
-        image_embeddings = self.image_encoder(image)
-        sparse_embeddings = self.prompt_encoder(points, boxes, image_size)
         
+        # 1. Run the heavy Image Encoder ONCE per image
+        image_embeddings = self.image_encoder(image) # Shape: (B, 256, 64, 64)
+        
+        # 2. Extract M (number of masks per image)
+        if boxes is not None:
+            M = boxes.shape[1]
+        elif points is not None:
+            M = points[0].shape[1]
+            
+        # Flatten the Batch and Mask dimensions for the lightweight decoders
+        if boxes is not None:
+            boxes = boxes.reshape(B * M, -1) # Shape: (B*M, 4)
+            
+        if points is not None:
+            coords, labels = points
+            coords = coords.reshape(B * M, -1, 2) # Shape: (B*M, N, 2)
+            labels = labels.reshape(B * M, -1)    # Shape: (B*M, N)
+            points = (coords, labels)
+            
+        # Repeat the image embeddings dynamically. 
+        # This creates a view/expansion that processes in parallel without redundant backbone compute.
+        image_embeddings = image_embeddings.repeat_interleave(M, dim=0) # Shape: (B*M, 256, 64, 64)
+        
+        # 3. Process all B*M prompts in parallel through the lightweight decoder
+        sparse_embeddings = self.prompt_encoder(points, boxes, image_size)
         masks, iou_preds = self.mask_decoder(image_embeddings, sparse_embeddings)
+        
+        # Interpolate the predictions back to the original image size
         masks = F.interpolate(masks, size=image_size, mode="bilinear", align_corners=False)
+        
+        # Reshape back to separate the Batch and Mask dimensions
+        masks = masks.reshape(B, M, self.num_masks, image_size[0], image_size[1])
+        iou_preds = iou_preds.reshape(B, M, self.num_masks)
+            
         return masks, iou_preds
-
 
 if __name__ == "__main__":
 
