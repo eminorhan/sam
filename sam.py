@@ -143,7 +143,7 @@ class MultiMaskDecoder(nn.Module):
         )
         self.norms = nn.ModuleList([nn.LayerNorm(transformer_dim) for _ in range(4)])
         
-        # UPDATE: 1 token for IoU prediction, plus 'num_masks' tokens for the actual masks
+        # 1 token for IoU prediction, plus 'num_masks' tokens for the actual masks
         self.num_mask_tokens = num_masks + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
         
@@ -155,7 +155,7 @@ class MultiMaskDecoder(nn.Module):
             nn.GELU()
         )
         
-        # UPDATE: A list of MLPs to generate hypernetwork weights for EACH mask
+        # A list of MLPs to generate hypernetwork weights for EACH mask
         self.output_hypernetworks_mlps = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(transformer_dim, transformer_dim),
@@ -164,7 +164,7 @@ class MultiMaskDecoder(nn.Module):
             ) for _ in range(self.num_masks)
         ])
         
-        # UPDATE: An MLP head to predict the IoU score for each of the 3 masks
+        # MLP head to predict the IoU score for each of the 3 masks
         self.iou_prediction_head = nn.Sequential(
             nn.Linear(transformer_dim, transformer_dim),
             nn.ReLU(),

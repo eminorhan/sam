@@ -1,5 +1,7 @@
 import os
 import logging
+import argparse
+import tomllib
 import torch
 import torch.optim as optim
 import numpy as np
@@ -28,8 +30,9 @@ from loss import SAMMultiMaskLoss
 def setup_distributed():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ['WORLD_SIZE'])
     torch.cuda.set_device(local_rank)
-    return local_rank
+    return local_rank, world_size
 
 def cleanup_distributed():
     dist.destroy_process_group()
@@ -123,22 +126,26 @@ def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
 # ==========================================
 # 2. Main Training Loop
 # ==========================================
-def train():
+def train(config):
 
     init_logger()
 
-    local_rank = setup_distributed()
+    local_rank, world_size = setup_distributed()
+
+    # --- Read config ---
+    tar_url = config['dataset']['tar_url']
+    model_name = config['model']['model_name']
+    batch_size = config['training']['batch_size']
+    num_masks_per_image = config['training']['num_masks_per_image']
+    image_size = tuple(config['training']['image_size'])  # convert list to tuple
+    log_steps = config['training']['log_steps']
+    grad_norm_clip = config['training']['grad_norm_clip']
+    epochs = config['training']['epochs']
+    warmup_steps = config['training']['warmup_steps']
+    backbone_lr = config['optimizer']['backbone_lr']
+    decoder_lr = config['optimizer']['decoder_lr']
 
     # --- Webdataset setup ---
-    # Define tarball pattern using brace expansion. 
-    tar_url = "/lustre/polis/stf218/scratch/emin/sa1b/sorted/sa_{000000..000999}.tar"
-    model_name = 'dinov3_vit7b16'
-    batch_size = 16
-    num_masks_per_image = 32
-    image_size = (1024, 1024)
-    log_steps = 100
-    grad_norm_clip = 1.0
-    
     # resampled=True causes nodes to randomly sample tarballs with replacement
     dataset = (
         wds.WebDataset(
@@ -164,7 +171,7 @@ def train():
     dataloader = wds.WebLoader(
         dataset, 
         batch_size=None,  # must be None because WebDataset handles batching internally
-        num_workers=8, 
+        num_workers=4, 
         pin_memory=True
     )
 
@@ -214,18 +221,16 @@ def train():
             decoder_params.append(param)
 
     # Using different learning rates for backbone vs. decoder parameters
-    optimizer = optim.AdamW([{'params': backbone_params, 'lr': 3e-5}, {'params': decoder_params, 'lr': 3e-4}], weight_decay=0.05)
+    optimizer = optim.AdamW([{'params': backbone_params, 'lr': backbone_lr}, {'params': decoder_params, 'lr': decoder_lr}], weight_decay=0.05)
     
     criterion = SAMMultiMaskLoss().to(local_rank)
     
     # --- Training Loop ---
     # Because resampled=True makes the dataset infinite, we define "epochs" by step count
-    steps_per_epoch = 10_000_000 // (batch_size * 16) 
-    epochs = 3
+    steps_per_epoch = 11_000_000 // (batch_size * world_size) 
 
     # --- LR Scheduler ---
     total_steps = epochs * steps_per_epoch
-    warmup_steps = 100
 
     # Bind the fixed arguments using partial
     bound_lr_lambda = partial(lr_lambda, warmup_steps=warmup_steps, total_steps=total_steps)
@@ -322,6 +327,16 @@ def train():
     if local_rank == 0:
         logger.info(f"✅ Checkpoint successfully saved to {checkpoint_dir}")
 
+
 if __name__ == "__main__":
-    train()
+
+    parser = argparse.ArgumentParser(description="Distributed training of segment-anything models with dinov3 image encoder")
+    parser.add_argument("--config", type=str, default="configs/train_config.toml", help="Path to the toml configuration file")
+    args = parser.parse_args()
+
+    # Load the toml file
+    with open(args.config, "rb") as f:
+        config = tomllib.load(f)
+
+    train(config)
     cleanup_distributed()

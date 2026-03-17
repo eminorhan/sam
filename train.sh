@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --gpus-per-node=8
-#SBATCH --time=00:10:00
+#SBATCH --time=6:00:00
 #SBATCH --job-name=train
 #SBATCH --output=train_%A_%a.out
 #SBATCH --array=0
@@ -28,6 +28,8 @@ export HF_HUB_OFFLINE=1
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=3442
 
-srun torchrun --nnodes $SLURM_NNODES --nproc_per_node $GPUS_PER_NODE --max_restarts 1 --node_rank $SLURM_NODEID --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$MASTER_ADDR:$MASTER_PORT" ./train.py
+CONFIG_FILE=${CONFIG_FILE:-"./configs/train_config.toml"}
+
+srun torchrun --nnodes $SLURM_NNODES --nproc_per_node $GPUS_PER_NODE --max_restarts 1 --node_rank $SLURM_NODEID --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$MASTER_ADDR:$MASTER_PORT" ./train.py --config ${CONFIG_FILE}
 
 echo "Done"
