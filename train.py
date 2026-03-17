@@ -1,4 +1,5 @@
 import os
+import glob
 import logging
 import argparse
 import tomllib
@@ -21,6 +22,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
 )
 
+# Import DCP APIs
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import DefaultLoadPlanner
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict, StateDictOptions
+
 # Import custom modules
 from dinov3.layers import SelfAttentionBlock
 from sam import SAMDINOv3
@@ -30,9 +36,10 @@ from loss import SAMMultiMaskLoss
 def setup_distributed():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
     world_size = int(os.environ['WORLD_SIZE'])
     torch.cuda.set_device(local_rank)
-    return local_rank, world_size
+    return local_rank, global_rank, world_size
 
 def cleanup_distributed():
     dist.destroy_process_group()
@@ -123,6 +130,26 @@ def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
     
     return image, box_prompts, point_coords, point_labels, gt_masks
 
+def verify_checkpoint_integrity(model, optimizer):
+    """Prints the norm of the first available parameter and its optimizer state."""
+    # Find the first parameter that requires gradients
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # 1. Check Model Weight Norm
+            weight_norm = param.norm().item()
+            logger.info(f"Integrity Check | Param: {name} | Weight Norm: {weight_norm:.4f}")
+            
+            # 2. Check Optimizer State Norm
+            state = optimizer.state.get(param)
+            if state is None or len(state) == 0:
+                logger.warning(f"⚠️ INTEGRITY FAILURE: No optimizer state found for {name}!")
+            else:
+                # AdamW usually has 'exp_avg' (momentum) and 'exp_avg_sq' (variance)
+                if 'exp_avg' in state:
+                    mom_norm = state['exp_avg'].norm().item()
+                    logger.info(f"Integrity Check | Param: {name} | Momentum Norm: {mom_norm:.4f}")
+            break # Just checking the first one is usually enough
+
 # ==========================================
 # 2. Main Training Loop
 # ==========================================
@@ -130,26 +157,34 @@ def train(config):
 
     init_logger()
 
-    local_rank, world_size = setup_distributed()
+    local_rank, global_rank, world_size = setup_distributed()
 
     # --- Read config ---
-    tar_url = config['dataset']['tar_url']
+    data_path = config['dataset']['data_path']
     model_name = config['model']['model_name']
+    run_name = config['training']['run_name']
     batch_size = config['training']['batch_size']
     num_masks_per_image = config['training']['num_masks_per_image']
     image_size = tuple(config['training']['image_size'])  # convert list to tuple
     log_steps = config['training']['log_steps']
+    ckpt_steps = config['training']['ckpt_steps']
     grad_norm_clip = config['training']['grad_norm_clip']
     epochs = config['training']['epochs']
     warmup_steps = config['training']['warmup_steps']
     backbone_lr = config['optimizer']['backbone_lr']
     decoder_lr = config['optimizer']['decoder_lr']
 
+    # --- Base Checkpoint Directory ---
+    checkpoint_base_dir = os.path.join("outputs", run_name, "checkpoint")
+    if global_rank == 0:
+        os.makedirs(checkpoint_base_dir, exist_ok=True)
+    dist.barrier()
+
     # --- Webdataset setup ---
     # resampled=True causes nodes to randomly sample tarballs with replacement
     dataset = (
         wds.WebDataset(
-            tar_url, 
+            data_path, 
             resampled=True, 
             nodesplitter=wds.split_by_node,
         )
@@ -222,111 +257,163 @@ def train(config):
 
     # Using different learning rates for backbone vs. decoder parameters
     optimizer = optim.AdamW([{'params': backbone_params, 'lr': backbone_lr}, {'params': decoder_params, 'lr': decoder_lr}], weight_decay=0.05)
-    
     criterion = SAMMultiMaskLoss().to(local_rank)
     
     # --- Training Loop ---
     # Because resampled=True makes the dataset infinite, we define "epochs" by step count
     steps_per_epoch = 11_000_000 // (batch_size * world_size) 
-
-    # --- LR Scheduler ---
     total_steps = epochs * steps_per_epoch
 
-    # Bind the fixed arguments using partial
+    # --- LR scheduler --
     bound_lr_lambda = partial(lr_lambda, warmup_steps=warmup_steps, total_steps=total_steps)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, bound_lr_lambda)
 
-    # Dataloader is an infinite iterator now
-    data_iterator = iter(dataloader)
+    # --- Resume from checkpoint ---
+    start_step = 0
     
-    for epoch in range(epochs):
-        model.train()
+    # 1. Find the latest checkpoint folder
+    latest_ckpt_path = None
+    step_dirs = glob.glob(os.path.join(checkpoint_base_dir, "step_*"))
+    if step_dirs:
+        step_nums = [int(os.path.basename(d).split("_")[1]) for d in step_dirs]
+        latest_step = max(step_nums)
+        latest_ckpt_path = os.path.join(checkpoint_base_dir, f"step_{latest_step}")
+
+    # 2. Load states if checkpoint exists
+    if latest_ckpt_path is not None:
+        logger.info(f"Resuming training from checkpoint: {latest_ckpt_path}")
+            
+        model_state_dict, opt_state_dict = get_state_dict(model, optimizer, options=StateDictOptions())
         
-        for step in range(steps_per_epoch):
+        checkpoint_data = {
+            "model": model_state_dict,
+            "optimizer": opt_state_dict,
+            "scheduler": scheduler.state_dict(), 
+            "step": 0
+        }
+        
+        dcp.load(
+            state_dict=checkpoint_data, 
+            checkpoint_id=latest_ckpt_path,
+            planner=DefaultLoadPlanner(allow_partial_load=True)            
+        )
+        
+        set_state_dict(
+            model, 
+            optimizer, 
+            model_state_dict=checkpoint_data["model"], 
+            optim_state_dict=checkpoint_data["optimizer"],
+            options=StateDictOptions(strict=False)            
+        )
+        scheduler.load_state_dict(checkpoint_data["scheduler"])
+        verify_checkpoint_integrity(model, optimizer)  # comment out after checking
+        start_step = checkpoint_data["step"] + 1
 
-            # Yield inputs
-            images, boxes, pt_coords, pt_labels, gt_masks = next(data_iterator)
+    # Dataloader is an infinite iterator
+    data_iterator = iter(dataloader)
+    model.train()
+    
+    logger.info(f"Starting training loop from step {start_step} to {total_steps}...")
+
+    for step in range(start_step, total_steps):
+        # Yield inputs
+        images, boxes, pt_coords, pt_labels, gt_masks = next(data_iterator)
+        
+        # boxes: (B, M, 4) | pt_coords: (B, M, 1, 2) | gt_masks: (B, M, 1, H, W)
+        boxes = boxes.to(local_rank)   
+        pt_coords = pt_coords.to(local_rank)   
+        pt_labels = pt_labels.to(local_rank)
+        
+        images = images.to(local_rank)
+        gt_masks = gt_masks.to(local_rank)
+        
+        optimizer.zero_grad()
+        
+        prompt_choice = np.random.choice(["box_only", "point_only", "both"])
+        
+        if prompt_choice == "box_only":
+            model_points = None
+            model_boxes = boxes
+        elif prompt_choice == "point_only":
+            model_points = (pt_coords, pt_labels)
+            model_boxes = None
+        else:
+            model_points = (pt_coords, pt_labels)
+            model_boxes = boxes
+        
+        # Forward pass outputs shapes: (B, M, 3, H, W) and (B, M, 3)
+        pred_masks, iou_preds = model(images, points=model_points, boxes=model_boxes)
+
+        gt_masks = gt_masks.to(pred_masks.dtype)
+
+        # Flatten the B and M dimensions so the loss function processes them like a standard batch
+        # Shape becomes: (B*M, 3, H, W) vs GT of (B*M, 1, H, W)
+        loss = criterion(
+            pred_masks.flatten(0, 1), 
+            iou_preds.flatten(0, 1), 
+            gt_masks.flatten(0, 1)
+        )
+
+        loss.backward()
+
+        # FSDP-safe gradient clipping: this safely handles cross-GPU communication to clip sharded gradients
+        model.clip_grad_norm_(grad_norm_clip)
+
+        optimizer.step()
+        scheduler.step()
+
+        # Logging
+        if step % log_steps == 0:
+            # Detach and clone the local loss so we don't break the autograd graph
+            global_loss = loss.detach().clone()
             
-            # boxes: (B, M, 4) | pt_coords: (B, M, 1, 2) | gt_masks: (B, M, 1, H, W)
-            boxes = boxes.to(local_rank)   
-            pt_coords = pt_coords.to(local_rank)   
-            pt_labels = pt_labels.to(local_rank)
+            # Average the loss across all ranks
+            dist.all_reduce(global_loss, op=dist.ReduceOp.AVG)
             
-            images = images.to(local_rank)
-            gt_masks = gt_masks.to(local_rank)
+            # Fetch current learning rates for logging
+            lr_backbone = optimizer.param_groups[0]['lr']
+            lr_decoder = optimizer.param_groups[1]['lr']
+
+            # Print the globally averaged loss only on Rank 0
+            logger.info(f"step {step}/{total_steps} | loss: {global_loss.item():.4f} | lr (backbone): {lr_backbone:.2e} | lr (decoder): {lr_decoder:.2e} ")
+
+        # Checkpointing
+        if step > 0 and step % ckpt_steps == 0:
+            dist.barrier()
+            ckpt_path = os.path.join(checkpoint_base_dir, f"step_{step}")
+            logger.info(f"Saving checkpoint at step {step} to {ckpt_path}...")
+
+            model_state_dict, opt_state_dict = get_state_dict(model, optimizer, options=StateDictOptions())
             
-            optimizer.zero_grad()
+            save_data = {
+                "model": model_state_dict,
+                "optimizer": opt_state_dict,
+                "scheduler": scheduler.state_dict(),
+                "step": step
+            }
             
-            prompt_choice = np.random.choice(["box_only", "point_only", "both"])
-            
-            if prompt_choice == "box_only":
-                model_points = None
-                model_boxes = boxes
-            elif prompt_choice == "point_only":
-                model_points = (pt_coords, pt_labels)
-                model_boxes = None
-            else:
-                model_points = (pt_coords, pt_labels)
-                model_boxes = boxes
-            
-            # Forward pass outputs shapes: (B, M, 3, H, W) and (B, M, 3)
-            pred_masks, iou_preds = model(images, points=model_points, boxes=model_boxes)
-
-            gt_masks = gt_masks.to(pred_masks.dtype)
-
-            # Flatten the B and M dimensions so the loss function processes them like a standard batch
-            # Shape becomes: (B*M, 3, H, W) vs GT of (B*M, 1, H, W)
-            loss = criterion(
-                pred_masks.flatten(0, 1), 
-                iou_preds.flatten(0, 1), 
-                gt_masks.flatten(0, 1)
-            )
-
-            loss.backward()
-
-            # FSDP-safe gradient clipping: this safely handles cross-GPU communication to clip sharded gradients
-            model.clip_grad_norm_(grad_norm_clip)
-
-            optimizer.step()
-            scheduler.step()
-
-            if step % log_steps == 0:
-                # Detach and clone the local loss so we don't break the autograd graph
-                global_loss = loss.detach().clone()
-                
-                # Average the loss across all ranks
-                dist.all_reduce(global_loss, op=dist.ReduceOp.AVG)
-                
-                # Fetch current learning rates for logging
-                lr_backbone = optimizer.param_groups[0]['lr']
-                lr_decoder = optimizer.param_groups[1]['lr']
-
-                # Print the globally averaged loss only on Rank 0
-                logger.info(f"epoch {epoch} | step {step}/{steps_per_epoch} | loss: {global_loss.item():.4f} | lr (backbone): {lr_backbone:.2e} | lr (decoder): {lr_decoder:.2e} ")
+            verify_checkpoint_integrity(model, optimizer) # comment out after checking
+            dcp.save(state_dict=save_data, checkpoint_id=ckpt_path)
+            logger.info("✅ Checkpoint successfully saved.")
 
     # Force all ranks to wait for each other before anyone starts saving
     # This prevents timeouts if one node finishes its final batch a few seconds early
     dist.barrier()
     
-    if local_rank == 0:
-        logger.info("Training complete! Initiating parallel checkpoint save...")
-
-    # Use Distributed Checkpointing API
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+    # Final save at the end of training
+    logger.info("Training complete! Initiating final checkpoint save...")
+    final_ckpt_path = os.path.join(checkpoint_base_dir, "final")
+    model_state_dict, opt_state_dict = get_state_dict(model, optimizer, options=StateDictOptions())
     
-    # Define a folder to hold the shards instead of a single file
-    checkpoint_dir = "/lustre/polis/stf218/scratch/emin/sam_dinov3_checkpoint"
+    save_data = {
+        "model": model_state_dict,
+        "optimizer": opt_state_dict,
+        "scheduler": scheduler.state_dict(),
+        "step": total_steps
+    }
     
-    # Get the sharded state dict (no network transfer required!)
-    state_dict = get_state_dict(model, options=StateDictOptions())
-    
-    # Save shards in parallel directly to Lustre
-    dcp.save(state_dict=state_dict, checkpoint_id=checkpoint_dir)
-
-    if local_rank == 0:
-        logger.info(f"✅ Checkpoint successfully saved to {checkpoint_dir}")
-
+    dcp.save(state_dict=save_data, checkpoint_id=final_ckpt_path)
+    logger.info(f"✅ Final checkpoint successfully saved to {final_ckpt_path}")
 
 if __name__ == "__main__":
 

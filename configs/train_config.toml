@@ -1,14 +1,16 @@
 [dataset]
-tar_url = "/lustre/polis/stf218/scratch/emin/sa1b/sorted/sa_{000000..000999}.tar"
+data_path = "/lustre/polis/stf218/scratch/emin/sa1b/sorted/sa_{000000..000999}.tar"
 
 [model]
 model_name = "dinov3_vit7b16"
 
 [training]
+run_name = "demo_7b"
 batch_size = 16
-num_masks_per_image = 45
+num_masks_per_image = 40
 image_size = [1024, 1024]  # toml arrays become python lists
 log_steps = 100
+ckpt_steps = 100
 grad_norm_clip = 1.0
 epochs = 3
 warmup_steps = 100
