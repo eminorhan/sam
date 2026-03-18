@@ -85,6 +85,7 @@ def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
     image = image_pil.convert("RGB")
     image = TF.resize(image, image_size)
     image = TF.to_tensor(image) # Shape: (3, H, W)
+    image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # normalize to use dinov3 backbones 
 
     # 3. Pick multiple annotations (pad with replacement if fewer than num_masks)
     anns = data['annotations']
@@ -130,25 +131,29 @@ def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
     
     return image, box_prompts, point_coords, point_labels, gt_masks
 
-def verify_checkpoint_integrity(model, optimizer):
-    """Prints the norm of the first available parameter and its optimizer state."""
-    # Find the first parameter that requires gradients
+def verify_training_health(model, optimizer):
+    """Finds the first locally owned 2D weight matrix to verify gradients/momentum."""
+    
     for name, param in model.named_parameters():
-        if param.requires_grad:
-            # 1. Check Model Weight Norm
-            weight_norm = param.norm().item()
-            logger.info(f"Integrity Check | Param: {name} | Weight Norm: {weight_norm:.4f}")
+        if not param.requires_grad:
+            continue
             
-            # 2. Check Optimizer State Norm
+        # 1. Ensure this GPU owns the shard
+        # 2. Look for 'weight' in the name (usually matrices, not tokens/biases)
+        if param.numel() > 0 and 'weight' in name and 'norm' not in name:
+            
             state = optimizer.state.get(param)
-            if state is None or len(state) == 0:
-                logger.warning(f"⚠️ INTEGRITY FAILURE: No optimizer state found for {name}!")
-            else:
-                # AdamW usually has 'exp_avg' (momentum) and 'exp_avg_sq' (variance)
-                if 'exp_avg' in state:
-                    mom_norm = state['exp_avg'].norm().item()
-                    logger.info(f"Integrity Check | Param: {name} | Momentum Norm: {mom_norm:.4f}")
-            break # Just checking the first one is usually enough
+            if state and 'exp_avg' in state:
+                mom_norm = state['exp_avg'].norm().item()
+                
+                # If we found a healthy, non-zero momentum, print it and stop!
+                if mom_norm > 0.0:
+                    weight_norm = param.norm().item()
+                    logger.info(f"✅ HEALTHY LAYER FOUND | Param: {name}")
+                    logger.info(f"   Weight Norm: {weight_norm:.4f} | Momentum Norm: {mom_norm:.4f}")
+                    return # We are good!
+                
+    logger.warning("⚠️ WARNING: Could not find ANY weight matrix with non-zero momentum on this rank!")
 
 # ==========================================
 # 2. Main Training Loop
@@ -306,7 +311,10 @@ def train(config):
             options=StateDictOptions(strict=False)            
         )
         scheduler.load_state_dict(checkpoint_data["scheduler"])
-        verify_checkpoint_integrity(model, optimizer)  # comment out after checking
+
+        # # 🟢 CHECK 2: Verify the loaded state applied correctly
+        # verify_training_health(model, optimizer)
+
         start_step = checkpoint_data["step"] + 1
 
     # Dataloader is an infinite iterator
@@ -380,6 +388,10 @@ def train(config):
         # Checkpointing
         if step > 0 and step % ckpt_steps == 0:
             dist.barrier()
+
+            # # 🟢 CHECK 1: Verify the live state before saving
+            # verify_training_health(model, optimizer) # comment out after checking
+
             ckpt_path = os.path.join(checkpoint_base_dir, f"step_{step}")
             logger.info(f"Saving checkpoint at step {step} to {ckpt_path}...")
 
@@ -392,7 +404,6 @@ def train(config):
                 "step": step
             }
             
-            verify_checkpoint_integrity(model, optimizer) # comment out after checking
             dcp.save(state_dict=save_data, checkpoint_id=ckpt_path)
             logger.info("✅ Checkpoint successfully saved.")
 

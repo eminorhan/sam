@@ -2,14 +2,14 @@
 
 #SBATCH --account=stf218
 #SBATCH --partition=batch-gpu
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --gpus-per-node=8
-#SBATCH --time=6:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=train
 #SBATCH --output=train_%A_%a.out
-#SBATCH --array=0
+#SBATCH --array=0-22
 
 # activate venv
 source /lustre/polis/stf218/scratch/emin/defiantvenv/bin/activate

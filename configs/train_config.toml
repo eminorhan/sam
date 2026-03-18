@@ -9,11 +9,11 @@ run_name = "demo_7b"
 batch_size = 16
 num_masks_per_image = 40
 image_size = [1024, 1024]  # toml arrays become python lists
-log_steps = 100
-ckpt_steps = 100
+log_steps = 5000
+ckpt_steps = 5000
 grad_norm_clip = 1.0
 epochs = 3
-warmup_steps = 100
+warmup_steps = 5000
 
 [optimizer]
 backbone_lr = 3e-5
