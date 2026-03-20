@@ -303,6 +303,11 @@ def train(config):
             planner=DefaultLoadPlanner(allow_partial_load=True)            
         )
         
+        # Force broadcast the dictionary from Rank 0 to Ranks 1-15
+        scheduler_dict_list = [checkpoint_data["scheduler"]]
+        dist.broadcast_object_list(scheduler_dict_list, src=0)
+        checkpoint_data["scheduler"] = scheduler_dict_list[0]
+
         set_state_dict(
             model, 
             optimizer, 
