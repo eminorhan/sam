@@ -32,6 +32,16 @@ from dinov3.layers import SelfAttentionBlock
 from sam import SAMDINOv3
 from loss import SAMMultiMaskLoss 
 
+# Import warnings to filter and suppress warnings (sorry, too many warnings, might revisit this later)
+import warnings
+
+# Suppress specific PyTorch distributed warnings
+warnings.filterwarnings("ignore", message=".*Please use DTensor instead.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*_get_pg_default_device will be deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*using the device under current context.*", category=UserWarning)
+# Suppress the WebDataset warning
+warnings.filterwarnings("ignore", message=".*WebDataset\\(shardshuffle=...\\) is None.*", category=UserWarning)
+
 # Distributed setup and cleanup
 def setup_distributed():
     dist.init_process_group(backend="nccl")
