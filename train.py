@@ -37,7 +37,7 @@ import warnings
 
 # Suppress specific PyTorch distributed warnings
 warnings.filterwarnings("ignore", message=".*Please use DTensor instead.*", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*_get_pg_default_device will be deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*it only stays for backward-compatiblity reason.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*using the device under current context.*", category=UserWarning)
 # Suppress the WebDataset warning
 warnings.filterwarnings("ignore", message=".*WebDataset\\(shardshuffle=...\\) is None.*", category=UserWarning)
@@ -77,7 +77,7 @@ def lr_lambda(current_step, warmup_steps, total_steps):
     return max(0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps)))
 
 # ==========================================
-# 1. Corrected WebDataset Preprocessing 
+# 1. Webdataset Preprocessing 
 # ==========================================
 def preprocess_sa1b(sample, image_size=(1024, 1024), num_masks_per_image=32):
     """
