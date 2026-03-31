@@ -263,9 +263,7 @@ class SAMDINOv3(nn.Module):
         image_embeddings = image_embeddings.repeat_interleave(M, dim=0) 
         
         # FIX: Generate and provide Dense Image Positional Encodings
-        image_pe = self.prompt_encoder.get_dense_pe(image_size)
-        image_pe = image_pe.repeat_interleave(M, dim=0)
-        
+        image_pe = self.prompt_encoder.get_dense_pe(image_size)        
         sparse_embeddings = self.prompt_encoder(points, boxes, image_size)
         masks, iou_preds = self.mask_decoder(image_embeddings, sparse_embeddings, image_pe)
         
@@ -275,6 +273,7 @@ class SAMDINOv3(nn.Module):
         iou_preds = iou_preds.reshape(B, M, self.num_masks)
             
         return masks, iou_preds
+
 
 if __name__ == "__main__":
 
@@ -286,7 +285,7 @@ if __name__ == "__main__":
 
     # 2. Dummy Inputs
     B, C, H, W = 2, 3, 1024, 1024
-    M = 2 # Let's test with 2 distinct mask prompts per image
+    M = 3 # Let's test with 2 distinct mask prompts per image
     dummy_image = torch.randn(B, C, H, W).to(device)
 
     # --- Point Prompt Setup ---
@@ -299,12 +298,12 @@ if __name__ == "__main__":
     # --- Box Prompt Setup ---
     # shape (B, M, 4) in format [x1, y1, x2, y2]
     boxes = torch.tensor([
-        [[100, 100, 400, 400], [500, 500, 800, 800]], 
-        [[200, 200, 600, 600], [150, 150, 300, 300]]
+        [[100, 100, 400, 400], [500, 500, 800, 800], [600, 600, 900, 900]], 
+        [[200, 200, 600, 600], [150, 150, 300, 300], [400, 400, 700, 700]]
     ], dtype=torch.float32).to(device)
 
     # 3. Forward Pass
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16): # Simulating FSDP/AMP context
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16): # Simulating FSDP/AMP context
         with torch.no_grad():
             pred_masks, iou_preds = model(dummy_image, points=points, boxes=boxes)
 
